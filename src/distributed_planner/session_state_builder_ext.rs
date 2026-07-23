@@ -1,5 +1,10 @@
+use crate::DistributedExt;
 use crate::distributed_planner::DistributedConfig;
 use crate::distributed_planner::distributed_query_planner::DistributedQueryPlanner;
+use crate::events::{
+    DesiredTaskCountHandlers, file_scan_config_desired_task_count,
+    file_scan_config_scale_up_leaf_node,
+};
 use datafusion::execution::SessionStateBuilder;
 use std::sync::Arc;
 
@@ -17,14 +22,19 @@ pub trait SessionStateBuilderExt {
 
 impl SessionStateBuilderExt for SessionStateBuilder {
     fn with_distributed_planner(mut self) -> Self {
-        DistributedConfig::ensure_in_config(self.config().get_or_insert_default());
-        self.config()
-            .get_or_insert_default()
-            .options_mut()
+        let cfg = self.config().get_or_insert_default();
+        DistributedConfig::ensure_in_config(cfg);
+        cfg.options_mut()
             .optimizer
             .enable_physical_uncorrelated_scalar_subquery = false;
+        DesiredTaskCountHandlers::register_built_in(
+            cfg,
+            Arc::new(file_scan_config_desired_task_count),
+        );
 
         let prev = std::mem::take(self.query_planner());
         self.with_query_planner(Arc::new(DistributedQueryPlanner { prev }))
+            .with_distributed_desired_task_count_handler(file_scan_config_desired_task_count)
+            .with_distributed_scale_up_leaf_node_handler(file_scan_config_scale_up_leaf_node)
     }
 }
