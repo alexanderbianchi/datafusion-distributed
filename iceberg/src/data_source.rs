@@ -222,7 +222,7 @@ impl IcebergDataSource {
     }
 }
 
-fn snapshot_statistics(
+pub(crate) fn snapshot_statistics(
     table: &iceberg::table::Table,
     snapshot_id: Option<i64>,
     schema: &SchemaRef,

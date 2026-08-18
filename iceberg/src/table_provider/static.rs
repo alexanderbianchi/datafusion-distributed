@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::memory::DataSourceExec;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{Result, plan_datafusion_err};
+use datafusion::common::{Result, Statistics, plan_datafusion_err};
 use datafusion::datasource::TableType;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::Partitioning;
@@ -13,7 +13,7 @@ use iceberg::arrow::schema_to_arrow_schema;
 
 use crate::IcebergDataSource;
 use crate::common::df_err;
-use crate::data_source::IcebergDataSourceOptions;
+use crate::data_source::{IcebergDataSourceOptions, snapshot_statistics};
 
 /// Static, read-only provider for a table or a specific snapshot.
 #[derive(Debug, Clone)]
@@ -21,6 +21,7 @@ pub struct IcebergStaticTableProvider {
     table: iceberg::table::Table,
     snapshot_id: Option<i64>,
     schema: SchemaRef,
+    statistics: Statistics,
     iceberg_runtime: iceberg::Runtime,
 }
 
@@ -47,10 +48,14 @@ impl IcebergStaticTableProvider {
             Arc::clone(table.metadata().current_schema())
         };
 
+        let schema = Arc::new(schema_to_arrow_schema(&table_schema).map_err(df_err)?);
+        let statistics = snapshot_statistics(&table, snapshot_id, &schema);
+
         Ok(Self {
             table,
             snapshot_id,
-            schema: Arc::new(schema_to_arrow_schema(&table_schema).map_err(df_err)?),
+            schema,
+            statistics,
             iceberg_runtime,
         })
     }
@@ -64,6 +69,10 @@ impl TableProvider for IcebergStaticTableProvider {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        Some(self.statistics.clone())
     }
 
     async fn scan(
@@ -92,5 +101,31 @@ impl TableProvider for IcebergStaticTableProvider {
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::common::stats::Precision;
+
+    use super::*;
+    use crate::test_utils::IcebergTestHarness;
+
+    #[tokio::test]
+    async fn exposes_snapshot_statistics_through_table_provider() -> Result<()> {
+        let harness = IcebergTestHarness::new().await?;
+        let provider = harness.context().table_provider("taxi").await?;
+        let statistics = provider
+            .statistics()
+            .expect("Iceberg tables expose snapshot statistics");
+
+        assert_eq!(statistics.num_rows, Precision::Inexact(175_000));
+        assert_eq!(statistics.total_byte_size, Precision::Inexact(4_480_382));
+        assert_eq!(
+            statistics.column_statistics.len(),
+            provider.schema().fields().len()
+        );
+
+        Ok(())
     }
 }

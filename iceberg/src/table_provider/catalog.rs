@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::Session;
+use datafusion::common::Statistics;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::Result;
@@ -14,7 +15,7 @@ use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
 use crate::IcebergDataSource;
 use crate::common::df_err;
-use crate::data_source::IcebergDataSourceOptions;
+use crate::data_source::{IcebergDataSourceOptions, snapshot_statistics};
 
 /// Catalog-backed, read-only table provider with automatic metadata refresh.
 ///
@@ -25,6 +26,7 @@ pub struct IcebergCatalogTableProvider {
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
     schema: SchemaRef,
+    statistics: Statistics,
     iceberg_runtime: iceberg::Runtime,
 }
 
@@ -38,12 +40,15 @@ impl IcebergCatalogTableProvider {
     ) -> Result<Self> {
         let table_ident = TableIdent::new(namespace, name.into());
         let table = catalog.load_table(&table_ident).await.map_err(df_err)?;
-        let schema = schema_to_arrow_schema(table.metadata().current_schema()).map_err(df_err)?;
+        let schema =
+            Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).map_err(df_err)?);
+        let statistics = snapshot_statistics(&table, None, &schema);
 
         Ok(Self {
             catalog,
             table_ident,
-            schema: Arc::new(schema),
+            schema,
+            statistics,
             iceberg_runtime,
         })
     }
@@ -57,6 +62,10 @@ impl TableProvider for IcebergCatalogTableProvider {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    fn statistics(&self) -> Option<Statistics> {
+        Some(self.statistics.clone())
     }
 
     async fn scan(
