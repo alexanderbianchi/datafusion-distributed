@@ -46,9 +46,9 @@ bincode = "1"
 tonic-prost = "0.14.2"
 
 # grpc-specific features
-arrow-flight = { version = "58", optional = true }
-arrow-select = { version = "58", optional = true }
-arrow-ipc = { version = "58", features = ["zstd"], optional = true }
+arrow-flight = { version = ">=58, <60", optional = true }
+arrow-select = { version = ">=58, <60", optional = true }
+arrow-ipc = { version = ">=58, <60", features = ["zstd"], optional = true }
 tonic = { version = "0.14.1", features = ["transport"], optional = true }
 tower = { version = "0.5.2", optional = true }
 
