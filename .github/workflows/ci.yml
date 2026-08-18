@@ -40,6 +40,7 @@ jobs:
           lfs: true
       - uses: ./.github/actions/setup
       - run: cargo test --features integration
+      - run: cargo test -p datafusion-distributed-iceberg
 
   tpch-correctness-test:
     runs-on: ubuntu-latest

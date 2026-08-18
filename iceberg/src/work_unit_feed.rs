@@ -1,8 +1,9 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
-use bytes::{Buf, BufMut};
 use datafusion::common::runtime::SpawnedTask;
-use datafusion::common::{Result, exec_err, internal_err};
+use datafusion::common::{
+    Result, exec_datafusion_err, exec_err, internal_err, not_impl_datafusion_err,
+};
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::Partitioning;
@@ -11,8 +12,9 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::expr::Predicate;
 use iceberg::scan::FileScanTask;
-use prost::encoding::{DecodeContext, WireType};
-use prost::{DecodeError, Message};
+use iceberg::spec::{Literal, NameMapping, PartitionSpec, PrimitiveLiteral, Struct};
+use ordered_float::OrderedFloat;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -90,8 +92,8 @@ pub struct IcebergWorkUnitFeed {
     /// Filters to apply to the table scan.
     pub(crate) predicates: Option<Predicate>,
     /// Partitioning scheme to which the feeds should adhere.
-    /// TODO: Today, only Partitioning::UnknownPartitioning partitioning is supported.
-    ///  Ideally, both Range partitioning and hash partitioning should be supported.
+    /// Unknown and round-robin partitioning can be satisfied at file granularity. Hash
+    /// partitioning requires routing rows, not whole files, and is rejected.
     pub(crate) partitioning: Partitioning,
     /// Container for the lazily initialized task that scans the Iceberg table.
     /// It will start as soon as the first [IcebergWorkUnitFeed::feed] is called.
@@ -119,14 +121,131 @@ pub(crate) struct SyncManager {
     feeds: TakeableVec<UnboundedReceiver<Result<FileScanTaskMessage>>>,
 }
 
-#[derive(Debug, Clone, Default)]
+/// Wire representation of one Iceberg file scan task.
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FileScanTaskMessage {
-    pub(crate) inner: Option<FileScanTask>,
+    #[prost(bytes = "vec", tag = "1")]
+    payload: Vec<u8>,
 }
 
 impl FileScanTaskMessage {
-    fn new(inner: FileScanTask) -> Self {
-        Self { inner: Some(inner) }
+    fn try_new(task: FileScanTask) -> Result<Self> {
+        let wire = FileScanTaskWire::try_from(task)?;
+        let payload = rmp_serde::to_vec_named(&wire).map_err(|error| {
+            exec_datafusion_err!("failed to serialize Iceberg file scan task: {error}")
+        })?;
+        Ok(Self { payload })
+    }
+
+    pub(crate) fn into_task(self) -> Result<FileScanTask> {
+        let wire = rmp_serde::from_slice::<FileScanTaskWire>(&self.payload).map_err(|error| {
+            exec_datafusion_err!("failed to deserialize Iceberg file scan task: {error}")
+        })?;
+        Ok(wire.into())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct FileScanTaskWire {
+    task: FileScanTask,
+    partition: Option<Vec<Option<PrimitiveLiteralWire>>>,
+    partition_spec: Option<PartitionSpec>,
+    name_mapping: Option<NameMapping>,
+}
+
+impl TryFrom<FileScanTask> for FileScanTaskWire {
+    type Error = DataFusionError;
+
+    fn try_from(mut task: FileScanTask) -> Result<Self> {
+        let partition = task
+            .partition
+            .take()
+            .map(|partition| {
+                partition
+                    .into_iter()
+                    .map(|literal| literal.map(PrimitiveLiteralWire::try_from).transpose())
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        let partition_spec = task.partition_spec.take().map(Arc::unwrap_or_clone);
+        let name_mapping = task.name_mapping.take().map(Arc::unwrap_or_clone);
+        Ok(Self {
+            task,
+            partition,
+            partition_spec,
+            name_mapping,
+        })
+    }
+}
+
+impl From<FileScanTaskWire> for FileScanTask {
+    fn from(wire: FileScanTaskWire) -> Self {
+        let mut task = wire.task;
+        task.partition = wire.partition.map(|partition| {
+            partition
+                .into_iter()
+                .map(|literal| literal.map(Into::into))
+                .collect::<Struct>()
+        });
+        task.partition_spec = wire.partition_spec.map(Arc::new);
+        task.name_mapping = wire.name_mapping.map(Arc::new);
+        task
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+enum PrimitiveLiteralWire {
+    Boolean(bool),
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+    String(String),
+    Binary(Vec<u8>),
+    Int128(i128),
+    UInt128(u128),
+    AboveMax,
+    BelowMin,
+}
+
+impl TryFrom<Literal> for PrimitiveLiteralWire {
+    type Error = DataFusionError;
+
+    fn try_from(literal: Literal) -> Result<Self> {
+        let Literal::Primitive(literal) = literal else {
+            return exec_err!("Iceberg partition values must be primitive literals");
+        };
+        Ok(match literal {
+            PrimitiveLiteral::Boolean(value) => Self::Boolean(value),
+            PrimitiveLiteral::Int(value) => Self::Int(value),
+            PrimitiveLiteral::Long(value) => Self::Long(value),
+            PrimitiveLiteral::Float(value) => Self::Float(value.into_inner()),
+            PrimitiveLiteral::Double(value) => Self::Double(value.into_inner()),
+            PrimitiveLiteral::String(value) => Self::String(value),
+            PrimitiveLiteral::Binary(value) => Self::Binary(value),
+            PrimitiveLiteral::Int128(value) => Self::Int128(value),
+            PrimitiveLiteral::UInt128(value) => Self::UInt128(value),
+            PrimitiveLiteral::AboveMax => Self::AboveMax,
+            PrimitiveLiteral::BelowMin => Self::BelowMin,
+        })
+    }
+}
+
+impl From<PrimitiveLiteralWire> for Literal {
+    fn from(literal: PrimitiveLiteralWire) -> Self {
+        Literal::Primitive(match literal {
+            PrimitiveLiteralWire::Boolean(value) => PrimitiveLiteral::Boolean(value),
+            PrimitiveLiteralWire::Int(value) => PrimitiveLiteral::Int(value),
+            PrimitiveLiteralWire::Long(value) => PrimitiveLiteral::Long(value),
+            PrimitiveLiteralWire::Float(value) => PrimitiveLiteral::Float(OrderedFloat(value)),
+            PrimitiveLiteralWire::Double(value) => PrimitiveLiteral::Double(OrderedFloat(value)),
+            PrimitiveLiteralWire::String(value) => PrimitiveLiteral::String(value),
+            PrimitiveLiteralWire::Binary(value) => PrimitiveLiteral::Binary(value),
+            PrimitiveLiteralWire::Int128(value) => PrimitiveLiteral::Int128(value),
+            PrimitiveLiteralWire::UInt128(value) => PrimitiveLiteral::UInt128(value),
+            PrimitiveLiteralWire::AboveMax => PrimitiveLiteral::AboveMax,
+            PrimitiveLiteralWire::BelowMin => PrimitiveLiteral::BelowMin,
+        })
     }
 }
 
@@ -159,6 +278,15 @@ impl WorkUnitFeedProvider for IcebergWorkUnitFeed {
             }
             let table_scan = scan_builder.build().map_err(df_err)?;
 
+            match &self.partitioning {
+                Partitioning::UnknownPartitioning(_) | Partitioning::RoundRobinBatch(_) => {}
+                Partitioning::Hash(_, _) => {
+                    return Err(Arc::new(not_impl_datafusion_err!(
+                        "Iceberg work-unit feeds cannot satisfy hash partitioning at file granularity"
+                    )));
+                }
+            }
+
             // Fanout the FileScanTask stream across P * T output channels where:
             // - P is the number of output partitions per distributed task (`partition_count`)
             // - T is the number of distributed tasks (`fan_out_tasks`)
@@ -176,19 +304,20 @@ impl WorkUnitFeedProvider for IcebergWorkUnitFeed {
             // the return streams of the `feed()` method.
             let task = SpawnedTask::spawn(async move {
                 let mut stream = match table_scan.plan_files().await {
-                    Ok(stream) => stream.map_ok(FileScanTaskMessage::new),
+                    Ok(stream) => stream
+                        .map_err(df_err)
+                        .and_then(|task| async move { FileScanTaskMessage::try_new(task) })
+                        .boxed(),
                     Err(err) => {
                         let _ = txs[0].send(Err(df_err(err)));
                         return;
                     }
                 };
 
-                // Round robing across output partitions.
-                // TODO: this is fine for Partitioning::UnknownPartitioning, but any other
-                //  partitioning will require smarter routing across output channels.
+                // Unknown and round-robin partitioning both permit round-robin file assignment.
                 let mut i = 0;
                 while let Some(scan_task_or_err) = stream.next().await {
-                    let _ = txs[i % txs.len()].send(scan_task_or_err.map_err(df_err));
+                    let _ = txs[i % txs.len()].send(scan_task_or_err);
                     i += 1;
                 }
             });

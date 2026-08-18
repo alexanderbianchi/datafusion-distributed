@@ -21,7 +21,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::instant::Instant;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::common::utils::get_available_parallelism;
-use datafusion::common::{config_err, exec_err, not_impl_err};
+use datafusion::common::{config_err, exec_datafusion_err, exec_err, not_impl_err};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::SessionStateBuilder;
@@ -38,6 +38,8 @@ use datafusion_distributed::{
 };
 use datafusion_distributed_benchmarks::datasets::{clickbench, register_tables, tpcds, tpch};
 use datafusion_distributed_benchmarks::stats::stats_estimation_q_error;
+use datafusion_distributed_iceberg::test_utils::{FIXTURE_URI, FixtureStorageFactory};
+use datafusion_distributed_iceberg::{IcebergExt, IcebergIntegrationOptions};
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
@@ -67,6 +69,10 @@ pub struct RunOpt {
     /// Path to data files
     #[structopt(long)]
     dataset: String,
+
+    /// Metadata JSON URI for the iceberg_remote dataset.
+    #[structopt(long, env = "ICEBERG_METADATA_LOCATION")]
+    iceberg_metadata_location: Option<String>,
 
     /// Spawns a worker in the specified port.
     #[structopt(long)]
@@ -144,6 +150,17 @@ fn queries_for_dataset(dataset: &str) -> Result<Vec<(String, String)>, DataFusio
             .into_iter()
             .map(|id| Ok((id.clone(), clickbench::get_query(&id)?)))
             .collect(),
+        "iceberg" => Ok(vec![
+            ("scan".to_string(), "SELECT * FROM taxi".to_string()),
+            (
+                "filter".to_string(),
+                "SELECT * FROM taxi WHERE pickup_date = DATE '2024-01-10'".to_string(),
+            ),
+            (
+                "aggregate".to_string(),
+                "SELECT pickup_date, COUNT(*) FROM taxi GROUP BY pickup_date".to_string(),
+            ),
+        ]),
         _ => not_impl_err!("Unknown benchmark dataset {dataset}"),
     }
 }
@@ -165,6 +182,7 @@ impl RunOpt {
             .build()?;
 
         if let Some(port) = self.spawn {
+            let use_fixture_storage = self.dataset == "iceberg_taxi";
             rt.block_on(async move {
                 let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
                 println!("Listening on {}...", listener.local_addr().unwrap());
@@ -173,10 +191,13 @@ impl RunOpt {
                 // node when the feature is on. The codec is registered via a
                 // session builder so it is installed on every worker session.
                 let worker = Worker::from_session_builder(
-                    |ctx: datafusion_distributed::WorkerQueryContext| async move {
+                    move |ctx: datafusion_distributed::WorkerQueryContext| async move {
                         Ok(ctx
                             .builder
                             .with_distributed_user_codec(WorkUnitFileScanCodec)
+                            .with_iceberg_integration(iceberg_integration_options(
+                                use_fixture_storage,
+                            ))
                             .build())
                     },
                 );
@@ -222,7 +243,8 @@ impl RunOpt {
                 dse.data_source()
                     .downcast_ref::<WorkUnitFileScanConfig>()
                     .map(|v| &v.feed)
-            });
+            })
+            .with_iceberg_integration(iceberg_integration_options(self.dataset == "iceberg_taxi"));
 
         if let Some(bytes_per_partition) = self.file_scan_config_bytes_per_partition {
             builder = builder
@@ -235,7 +257,26 @@ impl RunOpt {
 
         let state = builder.build();
         let ctx = SessionContext::new_with_state(state);
-        register_tables(&ctx, &self.get_path()?).await?;
+        if self.dataset.starts_with("iceberg_") {
+            let metadata_location = match self.dataset.as_str() {
+                "iceberg_taxi" => format!("{FIXTURE_URI}/metadata/v1.metadata.json"),
+                "iceberg_remote" => self.iceberg_metadata_location.clone().ok_or_else(|| {
+                    exec_datafusion_err!(
+                        "--iceberg-metadata-location is required for iceberg_remote"
+                    )
+                })?,
+                dataset => return not_impl_err!("Unknown Iceberg benchmark dataset {dataset}"),
+            };
+            let metadata_location = metadata_location.replace('\'', "''");
+            ctx.sql(&format!(
+                "CREATE EXTERNAL TABLE taxi STORED AS ICEBERG LOCATION '{metadata_location}'"
+            ))
+            .await?
+            .collect()
+            .await?;
+        } else {
+            register_tables(&ctx, &self.get_path()?).await?;
+        }
 
         println!("Running benchmarks with the following options: {self:?}");
         let mut benchmark_run = BenchmarkRun::new(
@@ -397,4 +438,14 @@ impl RunOpt {
         }
         get_available_parallelism()
     }
+}
+
+fn iceberg_integration_options(use_fixture_storage: bool) -> IcebergIntegrationOptions {
+    if use_fixture_storage {
+        return IcebergIntegrationOptions {
+            storage_factory: Arc::new(FixtureStorageFactory::default()),
+            iceberg_runtime: datafusion_distributed_iceberg::iceberg::Runtime::current(),
+        };
+    }
+    IcebergIntegrationOptions::default()
 }

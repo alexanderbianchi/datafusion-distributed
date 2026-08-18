@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::{Statistics, exec_datafusion_err};
+use datafusion::common::Statistics;
+use datafusion::common::stats::Precision;
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::source::DataSource;
 use datafusion::error::Result;
@@ -18,6 +19,7 @@ use datafusion::prelude::Expr;
 use datafusion_distributed::WorkUnitFeed;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::ArrowReaderBuilder;
+use iceberg::io::{FileIO, StorageConfig};
 
 use crate::common::{convert_filters_to_predicate, df_err, iceberg_err};
 use crate::{IcebergConfig, IcebergWorkUnitFeed};
@@ -115,9 +117,10 @@ pub struct IcebergDataSource {
     partitioning: Partitioning,
     fetch: Option<usize>,
     metrics: ExecutionPlanMetricsSet,
-    iceberg_file_io: iceberg::io::FileIO,
+    iceberg_file_io: FileIO,
     iceberg_runtime: iceberg::Runtime,
     feed: WorkUnitFeed<IcebergWorkUnitFeed>,
+    statistics: Arc<Statistics>,
 }
 
 /// Optional fields for building an [IcebergDataSource].
@@ -150,6 +153,12 @@ impl IcebergDataSource {
 
         let predicates = convert_filters_to_predicate(opts.filters);
 
+        let statistics = Arc::new(snapshot_statistics(
+            &table,
+            opts.snapshot_id,
+            &output_schema,
+        ));
+
         Self {
             schema: output_schema,
             iceberg_file_io: table.file_io().clone(),
@@ -167,7 +176,41 @@ impl IcebergDataSource {
                 partitioning,
                 sync_manager: Default::default(),
             }),
+            statistics,
         }
+    }
+
+    pub(crate) fn from_remote(
+        schema: SchemaRef,
+        partitioning: Partitioning,
+        fetch: Option<usize>,
+        iceberg_file_io: FileIO,
+        iceberg_runtime: iceberg::Runtime,
+        feed: WorkUnitFeed<IcebergWorkUnitFeed>,
+        statistics: Statistics,
+    ) -> Self {
+        Self {
+            schema,
+            partitioning,
+            fetch,
+            metrics: ExecutionPlanMetricsSet::new(),
+            iceberg_file_io,
+            iceberg_runtime,
+            feed,
+            statistics: Arc::new(statistics),
+        }
+    }
+
+    pub(crate) fn schema_ref(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    pub(crate) fn storage_config(&self) -> &StorageConfig {
+        self.iceberg_file_io.config()
+    }
+
+    pub(crate) fn statistics(&self) -> &Statistics {
+        &self.statistics
     }
 }
 
@@ -176,6 +219,46 @@ impl IcebergDataSource {
     /// DataSource with [iceberg::scan::FileScanTask] messages.
     pub fn feed(&self) -> &WorkUnitFeed<IcebergWorkUnitFeed> {
         &self.feed
+    }
+}
+
+fn snapshot_statistics(
+    table: &iceberg::table::Table,
+    snapshot_id: Option<i64>,
+    schema: &SchemaRef,
+) -> Statistics {
+    let snapshot = match snapshot_id {
+        Some(snapshot_id) => table.metadata().snapshot_by_id(snapshot_id),
+        None => table.metadata().current_snapshot(),
+    };
+    let Some(snapshot) = snapshot else {
+        return Statistics {
+            num_rows: Precision::Exact(0),
+            total_byte_size: Precision::Exact(0),
+            column_statistics: Statistics::unknown_column(schema),
+        };
+    };
+
+    let summary = &snapshot.summary().additional_properties;
+    Statistics {
+        num_rows: summary_precision(summary.get("total-records")),
+        total_byte_size: summary_precision(summary.get("total-files-size")),
+        column_statistics: Statistics::unknown_column(schema),
+    }
+}
+
+fn summary_precision(value: Option<&String>) -> Precision<usize> {
+    value
+        .and_then(|value| value.parse().ok())
+        .map(Precision::Inexact)
+        .unwrap_or(Precision::Absent)
+}
+
+fn divide_precision(value: Precision<usize>, divisor: usize) -> Precision<usize> {
+    match value {
+        Precision::Exact(value) => Precision::Exact(value.div_ceil(divisor)),
+        Precision::Inexact(value) => Precision::Inexact(value.div_ceil(divisor)),
+        Precision::Absent => Precision::Absent,
     }
 }
 
@@ -199,10 +282,7 @@ impl DataSource for IcebergDataSource {
             .feed
             .feed(partition, context)?
             .map(|msg_or_err| match msg_or_err {
-                Ok(msg) => match msg.inner {
-                    Some(msg) => Ok(msg),
-                    None => Err(iceberg_err(exec_datafusion_err!("Missing inner"))),
-                },
+                Ok(msg) => msg.into_task().map_err(iceberg_err),
                 Err(err) => Err(iceberg_err(err)),
             })
             .boxed();
@@ -240,6 +320,29 @@ impl DataSource for IcebergDataSource {
         Ok(())
     }
 
+    fn repartitioned(
+        &self,
+        target_partitions: usize,
+        _repartition_file_min_size: usize,
+        _output_ordering: Option<datafusion::physical_expr::LexOrdering>,
+    ) -> Result<Option<Arc<dyn DataSource>>> {
+        let partitioning = match &self.partitioning {
+            Partitioning::UnknownPartitioning(_) => {
+                Partitioning::UnknownPartitioning(target_partitions)
+            }
+            Partitioning::RoundRobinBatch(_) => Partitioning::RoundRobinBatch(target_partitions),
+            Partitioning::Hash(_, _) => return Ok(None),
+        };
+        let mut source = self.clone();
+        let Some(feed) = source.feed.inner_mut() else {
+            return Ok(None);
+        };
+        feed.partitioning = partitioning.clone();
+        feed.sync_manager = Default::default();
+        source.partitioning = partitioning;
+        Ok(Some(Arc::new(source)))
+    }
+
     fn output_partitioning(&self) -> Partitioning {
         self.partitioning.clone()
     }
@@ -248,11 +351,16 @@ impl DataSource for IcebergDataSource {
         EquivalenceProperties::new(Arc::clone(&self.schema))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
-        // TODO: Implement planning time statistics for this DataSource.
-        //  At this point, we have information about the iceberg::table::Table which we are about
-        //  to read, so maybe there's something we can get from there.
-        Ok(Arc::new(Statistics::new_unknown(&self.schema)))
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        if partition.is_none() {
+            return Ok(Arc::clone(&self.statistics));
+        }
+
+        let partition_count = self.partitioning.partition_count();
+        let mut statistics = self.statistics.as_ref().clone();
+        statistics.num_rows = divide_precision(statistics.num_rows, partition_count);
+        statistics.total_byte_size = divide_precision(statistics.total_byte_size, partition_count);
+        Ok(Arc::new(statistics))
     }
 
     fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn DataSource>> {

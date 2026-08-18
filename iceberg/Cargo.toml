@@ -20,10 +20,13 @@ typetag = "0.2"
 datafusion-distributed = { path = "..", features = ["sql"] }
 delegate = "0.13"
 prost = "0.14.1"
+ordered-float = "4"
+rmp-serde = "1"
 tokio = { version = "1.48", features = ["full"] }
 tokio-stream = "0.1"
 
 [dev-dependencies]
+datafusion-distributed = { path = "..", features = ["integration"] }
 insta = "1"
 parquet = "58"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

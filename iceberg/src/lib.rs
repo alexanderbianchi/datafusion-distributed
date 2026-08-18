@@ -3,8 +3,8 @@
 //! Read-only Apache Iceberg integration for DataFusion Distributed.
 //!
 //! This crate ports the read path from Apache Iceberg Rust's DataFusion
-//! integration. It deliberately contains no distributed execution adaptation
-//! and no Iceberg write or commit implementation.
+//! integration and streams Iceberg file scan tasks from the coordinator to workers.
+//! It does not implement Iceberg writes or commits.
 
 mod common;
 mod config;

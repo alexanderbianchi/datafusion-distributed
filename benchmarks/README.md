@@ -40,3 +40,29 @@ WORKERS=8 ./benchmarks/run.sh --threads 2 --dataset tpch_sf1 --file-scan-config-
 - `--dataset`: Dataset directory name under `benchmarks/data/`.
 - `--file-scan-config-bytes-per-partition`: How many bytes each partition is expected to scan. Lower values
   produce more partitions/tasks. Defaults to the engine default when unset.
+
+### Iceberg fixture benchmark
+
+The committed taxi fixture requires no data generation. Run its scan, filter, and aggregate
+queries with the `iceberg_taxi` dataset:
+
+```shell
+WORKERS=2 ./benchmarks/run.sh --threads 2 --dataset iceberg_taxi --file-scan-config-bytes-per-partition 100000
+```
+
+Use `--query scan`, `--query filter`, or `--query aggregate` to run one workload.
+
+### Remote Iceberg benchmark
+
+Use `iceberg_remote` with an Iceberg metadata JSON in object storage. The table must use the
+taxi fixture schema because it runs the same workloads as `iceberg_taxi`. Credentials are resolved
+by the Iceberg OpenDAL storage backend (for AWS, environment credentials or the EC2 instance role):
+
+```shell
+ICEBERG_METADATA_LOCATION=s3://bucket/warehouse/taxi/metadata/v1.metadata.json \
+WORKERS=8 ./benchmarks/run.sh --threads 2 --dataset iceberg_remote \
+  --file-scan-config-bytes-per-partition 16777216
+```
+
+All workers need network access and read permission for both metadata and data-file locations.
+This invocation also works in the EC2 benchmark environment described in `cdk/README.md`.

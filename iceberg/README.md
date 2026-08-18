@@ -28,6 +28,8 @@ async fn example() -> datafusion::error::Result<()> {
 The default storage factory resolves `file://`, S3 (`s3://`, `s3a://`,
 `s3n://`), and GCS (`gs://`, `gcs://`) URIs. Use
 `IcebergIntegrationOptions` to supply custom storage or an Iceberg runtime.
+Register the same integration on coordinator and worker session builders; physical plans and
+file-scan work units are serialized automatically during distributed execution.
 
 ```bash
 cargo test -p datafusion-distributed-iceberg
