@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Statistics;
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::stats::Precision;
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::source::DataSource;
@@ -20,6 +21,7 @@ use datafusion_distributed::WorkUnitFeed;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::io::{FileIO, StorageConfig};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::common::{convert_filters_to_predicate, df_err, iceberg_err};
 use crate::{IcebergConfig, IcebergWorkUnitFeed};
@@ -158,6 +160,9 @@ impl IcebergDataSource {
             opts.snapshot_id,
             &output_schema,
         ));
+        let iceberg_runtime = opts
+            .iceberg_runtime
+            .unwrap_or_else(iceberg::Runtime::current);
 
         Self {
             schema: output_schema,
@@ -165,15 +170,14 @@ impl IcebergDataSource {
             partitioning: partitioning.clone(),
             fetch: opts.fetch,
             metrics: ExecutionPlanMetricsSet::new(),
-            iceberg_runtime: opts
-                .iceberg_runtime
-                .unwrap_or_else(iceberg::Runtime::current),
+            iceberg_runtime: iceberg_runtime.clone(),
             feed: WorkUnitFeed::new(IcebergWorkUnitFeed {
                 iceberg_table: table,
                 snapshot_id: opts.snapshot_id,
                 projection,
                 predicates,
                 partitioning,
+                iceberg_runtime,
                 sync_manager: Default::default(),
             }),
             statistics,
@@ -287,11 +291,43 @@ impl DataSource for IcebergDataSource {
             })
             .boxed();
 
-        let stream = reader
+        let mut stream = reader
             .read(feed)
             .map(|result| result.stream())
             .map_err(df_err)?
             .map_err(df_err);
+
+        // Poll FileIO and Parquet futures on Iceberg's IO runtime rather than DataFusion's query
+        // CPU runtime, which may intentionally have Tokio IO disabled. A bounded channel preserves
+        // backpressure while moving completed batches back to DataFusion.
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let error_tx = tx.clone();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let io_task = self.iceberg_runtime.io().spawn(async move {
+            let produce = async move {
+                while let Some(batch) = stream.next().await {
+                    if tx.send(batch).await.is_err() {
+                        break;
+                    }
+                }
+            };
+
+            tokio::select! {
+                () = produce => {}
+                _ = cancel_rx => {}
+            }
+        });
+        let task = Arc::new(SpawnedTask::spawn(async move {
+            let _cancel_io_on_drop = cancel_tx;
+            if let Err(err) = io_task.await {
+                let _ = error_tx.send(Err(df_err(err))).await;
+            }
+        }));
+        let stream = ReceiverStream::new(rx)
+            .inspect(move |_| {
+                let _ = &task;
+            })
+            .boxed();
 
         let stream = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.schema),

@@ -95,6 +95,8 @@ pub struct IcebergWorkUnitFeed {
     /// Unknown and round-robin partitioning can be satisfied at file granularity. Hash
     /// partitioning requires routing rows, not whole files, and is rejected.
     pub(crate) partitioning: Partitioning,
+    /// Runtime whose IO handle polls manifest planning and task production.
+    pub(crate) iceberg_runtime: iceberg::Runtime,
     /// Container for the lazily initialized task that scans the Iceberg table.
     /// It will start as soon as the first [IcebergWorkUnitFeed::feed] is called.
     pub(crate) sync_manager: OnceLock<Result<SyncManager, Arc<DataFusionError>>>,
@@ -108,6 +110,7 @@ impl Clone for IcebergWorkUnitFeed {
             projection: self.projection.clone(),
             predicates: self.predicates.clone(),
             partitioning: self.partitioning.clone(),
+            iceberg_runtime: self.iceberg_runtime.clone(),
             sync_manager: Default::default(),
         }
     }
@@ -299,26 +302,47 @@ impl WorkUnitFeedProvider for IcebergWorkUnitFeed {
                 txs.push(tx);
             }
 
+            // Poll the complete planning stream on Iceberg's IO runtime. df-executor's query CPU
+            // runtimes intentionally have Tokio IO disabled, and plan_files performs direct IO
+            // before Iceberg can dispatch its internal work.
+            let iceberg_runtime = self.iceberg_runtime.clone();
+            let error_tx = txs[0].clone();
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
             // A reference to this spawned task needs to be held, otherwise it will automatically
-            // be canceled. The lifetime of this `task` variable needs to leave as long as any of
-            // the return streams of the `feed()` method.
+            // be canceled. The cancellation sender also stops the nested IO task when that happens.
             let task = SpawnedTask::spawn(async move {
-                let mut stream = match table_scan.plan_files().await {
-                    Ok(stream) => stream
-                        .map_err(df_err)
-                        .and_then(|task| async move { FileScanTaskMessage::try_new(task) })
-                        .boxed(),
-                    Err(err) => {
-                        let _ = txs[0].send(Err(df_err(err)));
-                        return;
-                    }
-                };
+                let io_task = iceberg_runtime.io().spawn(async move {
+                    let produce = async move {
+                        let mut stream = match table_scan.plan_files().await {
+                            Ok(stream) => stream
+                                .map_err(df_err)
+                                .and_then(|task| async move {
+                                    FileScanTaskMessage::try_new(task)
+                                })
+                                .boxed(),
+                            Err(err) => {
+                                let _ = txs[0].send(Err(df_err(err)));
+                                return;
+                            }
+                        };
 
-                // Unknown and round-robin partitioning both permit round-robin file assignment.
-                let mut i = 0;
-                while let Some(scan_task_or_err) = stream.next().await {
-                    let _ = txs[i % txs.len()].send(scan_task_or_err);
-                    i += 1;
+                        // Unknown and round-robin partitioning both permit round-robin file
+                        // assignment.
+                        let mut i = 0;
+                        while let Some(scan_task_or_err) = stream.next().await {
+                            let _ = txs[i % txs.len()].send(scan_task_or_err);
+                            i += 1;
+                        }
+                    };
+
+                    tokio::select! {
+                        () = produce => {}
+                        _ = cancel_rx => {}
+                    }
+                });
+                let _cancel_io_on_drop = cancel_tx;
+                if let Err(err) = io_task.await {
+                    let _ = error_tx.send(Err(df_err(err)));
                 }
             });
 
