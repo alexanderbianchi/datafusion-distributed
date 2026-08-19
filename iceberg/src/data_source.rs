@@ -13,11 +13,15 @@ use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_expr::{Partitioning, PhysicalSortExpr};
 use datafusion::physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion::physical_plan::limit::LimitStream;
-use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet};
+use datafusion::physical_plan::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayFormatType, SortOrderPushdownResult};
 use datafusion::prelude::Expr;
-use datafusion_distributed::WorkUnitFeed;
+use datafusion_distributed::{
+    BytesCounterMetric, BytesMetricExt, GaugeMetricExt, MaxGaugeMetric, WorkUnitFeed,
+};
 use futures::{StreamExt, TryStreamExt};
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::io::{FileIO, StorageConfig};
@@ -123,6 +127,60 @@ pub struct IcebergDataSource {
     iceberg_runtime: iceberg::Runtime,
     feed: WorkUnitFeed<IcebergWorkUnitFeed>,
     statistics: Arc<Statistics>,
+}
+
+#[derive(Clone)]
+struct FileScanTaskMetrics {
+    tasks: Count,
+    whole_file_tasks: Count,
+    split_file_tasks: Count,
+    planned_rows: Count,
+    tasks_without_record_count: Count,
+    delete_files: Count,
+    tasks_with_deletes: Count,
+    planned_file_bytes: BytesCounterMetric,
+    largest_file_bytes: MaxGaugeMetric,
+}
+
+impl FileScanTaskMetrics {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        let builder = || MetricBuilder::new(metrics);
+        Self {
+            tasks: builder().counter("file_scan_tasks", partition),
+            whole_file_tasks: builder().counter("whole_file_tasks", partition),
+            split_file_tasks: builder().counter("split_file_tasks", partition),
+            planned_rows: builder().counter("planned_rows", partition),
+            tasks_without_record_count: builder().counter("tasks_without_record_count", partition),
+            delete_files: builder().counter("delete_files", partition),
+            tasks_with_deletes: builder().counter("tasks_with_deletes", partition),
+            planned_file_bytes: builder().bytes_counter("planned_file_bytes"),
+            largest_file_bytes: builder().max_gauge("largest_file_bytes"),
+        }
+    }
+
+    fn record(&self, task: &iceberg::scan::FileScanTask) {
+        self.tasks.add(1);
+        let length = usize::try_from(task.length).unwrap_or(usize::MAX);
+        self.planned_file_bytes.add_bytes(length);
+        self.largest_file_bytes.set_max(length);
+
+        match task.record_count {
+            Some(rows) => {
+                self.whole_file_tasks.add(1);
+                self.planned_rows
+                    .add(usize::try_from(rows).unwrap_or(usize::MAX));
+            }
+            None => {
+                self.split_file_tasks.add(1);
+                self.tasks_without_record_count.add(1);
+            }
+        }
+
+        if !task.deletes.is_empty() {
+            self.tasks_with_deletes.add(1);
+            self.delete_files.add(task.deletes.len());
+        }
+    }
 }
 
 /// Optional fields for building an [IcebergDataSource].
@@ -282,11 +340,14 @@ impl DataSource for IcebergDataSource {
                 .with_row_selection_enabled(config.row_selection_enabled)
                 .build();
 
+        let file_metrics = FileScanTaskMetrics::new(&self.metrics, partition);
         let feed = self
             .feed
             .feed(partition, context)?
-            .map(|msg_or_err| match msg_or_err {
-                Ok(msg) => msg.into_task().map_err(iceberg_err),
+            .map(move |msg_or_err| match msg_or_err {
+                Ok(msg) => msg.into_task().map_err(iceberg_err).inspect(|task| {
+                    file_metrics.record(task);
+                }),
                 Err(err) => Err(iceberg_err(err)),
             })
             .boxed();
