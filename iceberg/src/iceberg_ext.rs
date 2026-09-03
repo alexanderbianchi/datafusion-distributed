@@ -59,12 +59,16 @@ pub trait IcebergExt: Sized {
 
     /// Enables or disables row-level selection for Iceberg reads.
     fn with_iceberg_row_selection_enabled(self, enabled: bool) -> Self;
+
+    fn set_iceberg_column_stats_enabled(&mut self, enabled: bool);
+    fn with_iceberg_column_stats_enabled(self, enabled: bool) -> Self;
 }
 
 trait IcebergConfigExt {
     fn set_iceberg_data_file_concurrency_limit(&mut self, limit: usize);
     fn set_iceberg_row_group_filtering_enabled(&mut self, enabled: bool);
     fn set_iceberg_row_selection_enabled(&mut self, enabled: bool);
+    fn set_iceberg_column_stats_enabled(&mut self, enabled: bool);
 }
 
 impl IcebergConfigExt for SessionConfig {
@@ -78,6 +82,10 @@ impl IcebergConfigExt for SessionConfig {
 
     fn set_iceberg_row_selection_enabled(&mut self, enabled: bool) {
         iceberg_config_mut(self).row_selection_enabled = enabled;
+    }
+
+    fn set_iceberg_column_stats_enabled(&mut self, enabled: bool) {
+        iceberg_config_mut(self).column_stats_enabled = enabled;
     }
 }
 
@@ -130,6 +138,7 @@ impl IcebergExt for SessionStateBuilder {
             fn set_iceberg_data_file_concurrency_limit(&mut self, limit: usize);
             fn set_iceberg_row_group_filtering_enabled(&mut self, enabled: bool);
             fn set_iceberg_row_selection_enabled(&mut self, enabled: bool);
+            fn set_iceberg_column_stats_enabled(&mut self, enabled: bool);
         }
 
         to self {
@@ -148,6 +157,10 @@ impl IcebergExt for SessionStateBuilder {
             #[call(set_iceberg_row_selection_enabled)]
             #[expr($;self)]
             fn with_iceberg_row_selection_enabled(mut self, enabled: bool) -> Self;
+
+            #[call(set_iceberg_column_stats_enabled)]
+            #[expr($;self)]
+            fn with_iceberg_column_stats_enabled(mut self, enabled: bool) -> Self;
         }
     }
 }
@@ -162,6 +175,7 @@ impl IcebergExt for SessionState {
             fn set_iceberg_data_file_concurrency_limit(&mut self, limit: usize);
             fn set_iceberg_row_group_filtering_enabled(&mut self, enabled: bool);
             fn set_iceberg_row_selection_enabled(&mut self, enabled: bool);
+            fn set_iceberg_column_stats_enabled(&mut self, enabled: bool);
         }
 
         to self {
@@ -180,6 +194,10 @@ impl IcebergExt for SessionState {
             #[call(set_iceberg_row_selection_enabled)]
             #[expr($;self)]
             fn with_iceberg_row_selection_enabled(mut self, enabled: bool) -> Self;
+
+            #[call(set_iceberg_column_stats_enabled)]
+            #[expr($;self)]
+            fn with_iceberg_column_stats_enabled(mut self, enabled: bool) -> Self;
         }
     }
 }
@@ -191,6 +209,7 @@ impl IcebergExt for SessionContext {
             fn set_iceberg_data_file_concurrency_limit(&mut self, limit: usize);
             fn set_iceberg_row_group_filtering_enabled(&mut self, enabled: bool);
             fn set_iceberg_row_selection_enabled(&mut self, enabled: bool);
+            fn set_iceberg_column_stats_enabled(&mut self, enabled: bool);
         }
 
         to self {
@@ -209,6 +228,10 @@ impl IcebergExt for SessionContext {
             #[call(set_iceberg_row_selection_enabled)]
             #[expr($;self)]
             fn with_iceberg_row_selection_enabled(mut self, enabled: bool) -> Self;
+
+            #[call(set_iceberg_column_stats_enabled)]
+            #[expr($;self)]
+            fn with_iceberg_column_stats_enabled(mut self, enabled: bool) -> Self;
         }
     }
 }
