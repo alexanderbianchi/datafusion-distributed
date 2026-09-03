@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
@@ -130,7 +131,8 @@ pub struct IcebergDataSource {
     partitioning: Partitioning,
     fetch: Option<usize>,
     metrics: ExecutionPlanMetricsSet,
-    column_stats: Option<Arc<Vec<ColumnStatistics>>>,
+    column_stats: Option<Arc<HashMap<i32, ColumnStatistics>>>,
+    projected_field_ids: Arc<Vec<i32>>,
     current_snapshot: Option<SnapshotRef>,
     iceberg_file_io: iceberg::io::FileIO,
     iceberg_runtime: iceberg::Runtime,
@@ -164,6 +166,21 @@ impl IcebergDataSource {
                 .map(|p| schema.field(*p).name().clone())
                 .collect::<Vec<String>>()
         });
+        let projected_field_ids = if let Some(projection) = opts.projection {
+            let table_schema = table.metadata().current_schema();
+            let fields = table_schema.as_struct().fields();
+            projection.iter().map(|&idx| fields[idx].id).collect()
+        } else {
+            // Full schema in case of no projection
+            table
+                .metadata()
+                .current_schema()
+                .as_struct()
+                .fields()
+                .iter()
+                .map(|f| f.id)
+                .collect()
+        };
         let current_snapshot = table.metadata().current_snapshot().cloned();
 
         let predicates = convert_filters_to_predicate(opts.filters);
@@ -186,6 +203,7 @@ impl IcebergDataSource {
                 sync_manager: Default::default(),
             }),
             current_snapshot,
+            projected_field_ids: Arc::new(projected_field_ids),
             column_stats: None,
         }
     }
@@ -281,10 +299,10 @@ impl DataSource for IcebergDataSource {
         let mut stats = stats_from_snapshot(self.current_snapshot.clone(), &self.schema)?;
 
         if let Some(col_stats) = &self.column_stats {
-            // Lengths should always match
-            debug_assert_eq!(col_stats.len(), stats.column_statistics.len());
-            for (i, cs) in col_stats.iter().enumerate() {
-                stats.column_statistics[i] = cs.clone();
+            for (i, &field_id) in self.projected_field_ids.iter().enumerate() {
+                if let Some(cs) = col_stats.get(&field_id) {
+                    stats.column_statistics[i] = cs.clone();
+                }
             }
         }
 
@@ -365,17 +383,14 @@ fn stats_from_snapshot(snapshot: Option<SnapshotRef>, schema: &SchemaRef) -> Res
 /// Reading table statistics from data-files concurrently
 pub async fn compute_column_stats(
     table: Table,
-) -> datafusion::common::Result<Arc<Vec<ColumnStatistics>>> {
+) -> datafusion::common::Result<Arc<HashMap<i32, ColumnStatistics>>> {
     let metadata = table.metadata();
     let schema = metadata.current_schema();
     let fields_ids: Vec<i32> = schema.as_struct().fields().iter().map(|f| f.id).collect();
 
     // A table with no current snapshot has never had a commit. It was created, but zero data files were added
     let Some(snapshot) = metadata.current_snapshot() else {
-        return Ok(Arc::new(vec![
-            ColumnStatistics::new_unknown();
-            fields_ids.len()
-        ]));
+        return Ok(Arc::new(HashMap::new()));
     };
     let ml_bytes = table
         .file_io()
@@ -454,7 +469,13 @@ pub async fn compute_column_stats(
         }
     }
 
-    Ok(Arc::new(merged_col_stats))
+    // Convert to a mapping
+    let mut stats_map = HashMap::with_capacity(fields_ids.len());
+    for (i, &field_id) in fields_ids.iter().enumerate() {
+        stats_map.insert(field_id, merged_col_stats[i].clone());
+    }
+
+    Ok(Arc::new(stats_map))
 }
 
 /// Convertion function of iceberg's Datum
