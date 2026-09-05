@@ -8,12 +8,14 @@ mod tests {
     use datafusion::error::Result;
     use datafusion::physical_plan::{ExecutionPlan, displayable};
     use datafusion_distributed_iceberg::IcebergDataSource;
-    use datafusion_distributed_iceberg::test_utils::IcebergTestHarness;
+    use datafusion_distributed_iceberg::test_utils::{FIXTURE_URI, IcebergTestHarness};
+    use iceberg::spec::{Operation, Snapshot, Summary};
 
     // Values from testdata/iceberg/taxi/metadata/v1.metadata.json snapshot summary.
     const TAXI_ROWS: usize = 175_000;
     const TAXI_BYTES: usize = 4_480_382;
     const TAXI_COLUMNS: usize = 13;
+    const TAXI_MANIFEST_LIST: &str = "s3://iceberg-test/warehouse/taxi/metadata/snap-3167948105555765929-0-019fdb82-eb66-7582-99a7-9f864b92a53f.avro";
 
     #[tokio::test]
     async fn reports_exact_row_count_and_byte_size_for_full_scan() -> Result<()> {
@@ -39,6 +41,28 @@ mod tests {
 
         assert_eq!(stats.num_rows, Precision::Absent);
         assert_eq!(stats.total_byte_size, Precision::Absent);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_statistics_for_the_selected_snapshot() -> Result<()> {
+        let harness = IcebergTestHarness::builder()
+            .add_snapshot(snapshot_with_statistics(42, 42, 4_242))
+            .build()
+            .await?;
+        harness
+            .query(&format!(
+                "CREATE EXTERNAL TABLE historical_taxi STORED AS ICEBERG \
+                 LOCATION '{FIXTURE_URI}/metadata/v1.metadata.json' \
+                 OPTIONS ('iceberg.snapshot_id' '42')"
+            ))
+            .await?;
+
+        let stats = source_statistics(&harness, "SELECT * FROM historical_taxi").await?;
+
+        // TODO(#687): Make statistics use the selected snapshot.
+        assert_eq!(stats.num_rows, Precision::Exact(42));
+        assert_eq!(stats.total_byte_size, Precision::Exact(4_242));
         Ok(())
     }
 
@@ -146,5 +170,24 @@ mod tests {
             }
         }
         plan.children().into_iter().find_map(find_iceberg_exec)
+    }
+
+    fn snapshot_with_statistics(id: i64, rows: usize, bytes: usize) -> Snapshot {
+        Snapshot::builder()
+            .with_snapshot_id(id)
+            .with_sequence_number(0)
+            .with_timestamp_ms(1_786_094_218_148)
+            .with_manifest_list(TAXI_MANIFEST_LIST)
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: [
+                    ("total-records".to_string(), rows.to_string()),
+                    ("total-files-size".to_string(), bytes.to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            })
+            .with_schema_id(0)
+            .build()
     }
 }

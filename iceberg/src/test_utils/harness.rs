@@ -85,53 +85,79 @@ impl IcebergTestHarness {
 
 pub struct IcebergTestHarnessBuilder {
     metadata: TableMetadata,
+    snapshots: Vec<Snapshot>,
+    current_snapshot_id: Option<i64>,
 }
 
 impl Default for IcebergTestHarnessBuilder {
     fn default() -> Self {
-        let metadata = serde_json::from_str(include_str!(
+        let metadata: TableMetadata = serde_json::from_str(include_str!(
             "../../../testdata/iceberg/taxi/metadata/v1.metadata.json"
         ))
         .expect("taxi metadata is valid JSON");
-        Self { metadata }
+        let snapshots = metadata
+            .snapshots()
+            .map(|snapshot| snapshot.as_ref().clone())
+            .collect();
+        let current_snapshot_id = metadata.current_snapshot_id();
+        Self {
+            metadata,
+            snapshots,
+            current_snapshot_id,
+        }
     }
 }
 
 impl IcebergTestHarnessBuilder {
-    pub fn edit_current_snapshot_summary(self, edit: impl FnOnce(&mut Summary)) -> Self {
-        Self {
-            metadata: rebuild_with_current_snapshot_summary(self.metadata, edit),
-        }
+    /// Adds a snapshot without changing the table's current snapshot.
+    pub fn add_snapshot(mut self, snapshot: Snapshot) -> Self {
+        self.snapshots.push(snapshot);
+        self
+    }
+
+    pub fn edit_current_snapshot_summary(mut self, edit: impl FnOnce(&mut Summary)) -> Self {
+        let current_snapshot_id = self
+            .current_snapshot_id
+            .expect("taxi metadata has a current snapshot");
+        let current = self
+            .snapshots
+            .iter_mut()
+            .find(|snapshot| snapshot.snapshot_id() == current_snapshot_id)
+            .expect("taxi metadata contains its current snapshot");
+        let mut summary = current.summary().clone();
+        edit(&mut summary);
+        *current = snapshot_with_summary(current, summary);
+        self
     }
 
     pub async fn build(self) -> Result<IcebergTestHarness> {
-        let metadata = serde_json::to_vec(&self.metadata)
+        let metadata =
+            rebuild_with_snapshots(self.metadata, self.snapshots, self.current_snapshot_id);
+        let metadata = serde_json::to_vec(&metadata)
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
         IcebergTestHarness::with_table_metadata(metadata).await
     }
 }
 
-fn rebuild_with_current_snapshot_summary(
-    metadata: TableMetadata,
-    edit: impl FnOnce(&mut Summary),
-) -> TableMetadata {
-    let current = metadata
-        .current_snapshot()
-        .expect("taxi metadata has a current snapshot");
-    let mut summary = current.summary().clone();
-    edit(&mut summary);
-
-    let snapshot = Snapshot::builder()
-        .with_snapshot_id(current.snapshot_id())
-        .with_parent_snapshot_id(current.parent_snapshot_id())
-        .with_sequence_number(current.sequence_number())
-        .with_timestamp_ms(current.timestamp_ms())
-        .with_manifest_list(current.manifest_list())
+fn snapshot_with_summary(snapshot: &Snapshot, summary: Summary) -> Snapshot {
+    Snapshot::builder()
+        .with_snapshot_id(snapshot.snapshot_id())
+        .with_parent_snapshot_id(snapshot.parent_snapshot_id())
+        .with_sequence_number(snapshot.sequence_number())
+        .with_timestamp_ms(snapshot.timestamp_ms())
+        .with_manifest_list(snapshot.manifest_list())
         .with_summary(summary)
-        .with_schema_id(current.schema_id().expect("taxi snapshot has a schema ID"))
-        .build();
+        .with_schema_id(snapshot.schema_id().expect("taxi snapshot has a schema ID"))
+        .build()
+}
 
-    TableMetadataBuilder::new(
+fn rebuild_with_snapshots(
+    metadata: TableMetadata,
+    mut snapshots: Vec<Snapshot>,
+    current_snapshot_id: Option<i64>,
+) -> TableMetadata {
+    snapshots.sort_by_key(|snapshot| (snapshot.sequence_number(), snapshot.timestamp_ms()));
+    let mut builder = TableMetadataBuilder::new(
         metadata.current_schema().as_ref().clone(),
         metadata
             .default_partition_spec()
@@ -144,12 +170,21 @@ fn rebuild_with_current_snapshot_summary(
         metadata.properties().clone(),
     )
     .expect("taxi metadata can be rebuilt")
-    .assign_uuid(metadata.uuid())
-    .set_branch_snapshot(snapshot, "main")
-    .expect("taxi snapshot can be added")
-    .build()
-    .expect("taxi metadata remains valid")
-    .metadata
+    .assign_uuid(metadata.uuid());
+
+    for snapshot in snapshots {
+        builder = if Some(snapshot.snapshot_id()) == current_snapshot_id {
+            builder.set_branch_snapshot(snapshot, "main")
+        } else {
+            builder.add_snapshot(snapshot)
+        }
+        .expect("taxi snapshot can be added");
+    }
+
+    builder
+        .build()
+        .expect("taxi metadata remains valid")
+        .metadata
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
