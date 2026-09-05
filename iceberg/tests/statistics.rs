@@ -7,8 +7,12 @@ mod tests {
     use datafusion::datasource::source::DataSourceExec;
     use datafusion::error::Result;
     use datafusion::physical_plan::{ExecutionPlan, displayable};
-    use datafusion_distributed_iceberg::test_utils::{FIXTURE_URI, IcebergTestHarness};
+    use datafusion_distributed_iceberg::test_utils::{
+        IcebergTestHarness, taxi_metadata_builder, taxi_snapshot,
+    };
+    use datafusion_distributed_iceberg::test_utils::FIXTURE_URI;
     use datafusion_distributed_iceberg::{IcebergDataSource, IcebergExt};
+    use iceberg::spec::{Operation, Summary, TableMetadata};
 
     // Took values from testdata/iceberg/taxi/metadata/v1.metadata.json snapshot summary.
     // Under `snapshots` key in the JSON
@@ -30,11 +34,7 @@ mod tests {
     #[tokio::test]
     async fn missing_snapshot_summary_statistics_are_absent() -> Result<()> {
         let harness = IcebergTestHarness::builder()
-            .edit_current_snapshot_summary(|summary| {
-                for key in ["total-records", "total-files-size"] {
-                    assert!(summary.additional_properties.remove(key).is_some());
-                }
-            })
+            .with_table_metadata(metadata_without_summary_statistics())
             .build()
             .await?;
         let stats = source_statistics(&harness, "SELECT * FROM taxi").await?;
@@ -256,5 +256,18 @@ mod tests {
             return Some(Arc::new(exec.clone()));
         }
         plan.children().into_iter().find_map(find_iceberg_exec)
+    }
+
+    fn metadata_without_summary_statistics() -> TableMetadata {
+        let snapshot = taxi_snapshot(Summary {
+            operation: Operation::Append,
+            additional_properties: Default::default(),
+        });
+        taxi_metadata_builder()
+            .set_branch_snapshot(snapshot, "main")
+            .expect("taxi snapshot can be added")
+            .build()
+            .expect("taxi metadata is valid")
+            .metadata
     }
 }
