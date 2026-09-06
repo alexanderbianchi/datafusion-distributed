@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod tests {
     use datafusion::error::Result;
-    use datafusion_distributed_iceberg::test_utils::{FIXTURE_URI, IcebergTestHarness};
+    use datafusion_distributed_iceberg::test_utils::{
+        FIXTURE_URI, IcebergTestHarness, taxi_metadata_builder,
+    };
 
     #[tokio::test]
     async fn registers_the_fixture_with_the_iceberg_schema() -> Result<()> {
@@ -28,6 +30,31 @@ mod tests {
     +---------------------+---------------+-------------+
     ");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_metadata_file_overrides_the_default_fixture() -> Result<()> {
+        let metadata = taxi_metadata_builder()
+            .build()
+            .expect("valid empty table")
+            .metadata;
+        let harness = IcebergTestHarness::builder()
+            .with_file(
+                format!("{FIXTURE_URI}/metadata/v1.metadata.json"),
+                serde_json::to_vec(&metadata).expect("metadata serializes"),
+            )
+            .build()
+            .await?;
+        let (_, batches) = harness.query("SELECT COUNT(*) AS trips FROM taxi").await?;
+
+        insta::assert_snapshot!(batches, @"
+        +-------+
+        | trips |
+        +-------+
+        | 0     |
+        +-------+
+        ");
         Ok(())
     }
 

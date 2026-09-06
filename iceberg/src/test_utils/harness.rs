@@ -105,6 +105,7 @@ impl IcebergTestHarness {
 pub struct IcebergTestHarnessBuilder {
     metadata: TableMetadata,
     table_options: BTreeMap<String, String>,
+    files: HashMap<String, Vec<u8>>,
 }
 
 impl Default for IcebergTestHarnessBuilder {
@@ -112,6 +113,7 @@ impl Default for IcebergTestHarnessBuilder {
         Self {
             metadata: taxi_metadata(),
             table_options: BTreeMap::new(),
+            files: HashMap::new(),
         }
     }
 }
@@ -129,10 +131,23 @@ impl IcebergTestHarnessBuilder {
         self
     }
 
-    pub async fn build(self) -> Result<IcebergTestHarness> {
+    /// Overrides a fixture URI with in-memory bytes; later files replace earlier ones.
+    /// An explicit file also takes precedence over the generated table metadata.
+    pub fn with_file(mut self, uri: impl Into<String>, bytes: impl Into<Vec<u8>>) -> Self {
+        self.files.insert(uri.into(), bytes.into());
+        self
+    }
+
+    pub async fn build(mut self) -> Result<IcebergTestHarness> {
         let metadata = serde_json::to_vec(&self.metadata)
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let storage_factory = FixtureStorageFactory::with_file(FIXTURE_METADATA_URI, metadata);
+        self.files
+            .entry(FIXTURE_METADATA_URI.to_string())
+            .or_insert(metadata);
+        let storage_factory = FixtureStorageFactory {
+            files: self.files,
+            ..FixtureStorageFactory::default()
+        };
         IcebergTestHarness::create(storage_factory, self.table_options).await
     }
 }
@@ -148,15 +163,6 @@ impl Default for FixtureStorageFactory {
         Self {
             root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testdata/iceberg"),
             files: HashMap::new(),
-        }
-    }
-}
-
-impl FixtureStorageFactory {
-    fn with_file(path: &str, bytes: Vec<u8>) -> Self {
-        Self {
-            files: HashMap::from([(path.to_string(), bytes)]),
-            ..Self::default()
         }
     }
 }
