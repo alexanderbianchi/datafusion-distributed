@@ -141,12 +141,7 @@ mod tests {
         let children = plan.children();
         assert_eq!(children.len(), 1, "count projection must have one child");
         assert_eq!(children[0].name(), "PlaceholderRowExec");
-        assert_scalar_result(
-            &batches,
-            "count(*)",
-            ScalarValue::Int64(Some(TAXI_ROWS as i64)),
-        )?;
-        Ok(())
+        assert_scalar_result(&batches, "count(*)", (TAXI_ROWS as i64).into())
     }
 
     // Observe the query's output statistics, including projection and propagation.

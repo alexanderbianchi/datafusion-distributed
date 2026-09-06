@@ -3,7 +3,6 @@ mod common;
 #[cfg(test)]
 mod tests {
     use datafusion::error::Result;
-    use datafusion::scalar::ScalarValue;
     use datafusion_distributed_iceberg::test_utils::{
         FIXTURE_URI, IcebergTestHarness, taxi_metadata_builder,
     };
@@ -55,8 +54,7 @@ mod tests {
             .query_raw("SELECT COUNT(*) AS trips FROM taxi")
             .await?;
 
-        assert_scalar_result(&batches, "trips", ScalarValue::Int64(Some(0)))?;
-        Ok(())
+        assert_scalar_result(&batches, "trips", 0_i64.into())
     }
 
     #[tokio::test]
@@ -87,9 +85,7 @@ mod tests {
             .query_raw("SELECT COUNT(*) AS trips FROM taxi")
             .await?;
 
-        assert_scalar_result(&batches, "trips", ScalarValue::Int64(Some(175_000)))?;
-
-        Ok(())
+        assert_scalar_result(&batches, "trips", 175_000_i64.into())
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::Result;
 use datafusion::scalar::ScalarValue;
 
+#[track_caller]
 pub(crate) fn assert_scalar_result(
     batches: &[RecordBatch],
     column: &str,
