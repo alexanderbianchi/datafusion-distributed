@@ -43,41 +43,6 @@ impl IcebergTestHarness {
         Self::builder().build().await
     }
 
-    async fn create(
-        storage_factory: FixtureStorageFactory,
-        table_options: BTreeMap<String, String>,
-    ) -> Result<Self> {
-        let state = SessionStateBuilder::new()
-            .with_default_features()
-            .with_config(SessionConfig::new().with_target_partitions(4))
-            .with_iceberg_integration(IcebergIntegrationOptions {
-                storage_factory: Arc::new(storage_factory),
-                iceberg_runtime: iceberg::Runtime::current(),
-            })
-            .build();
-        let ctx = SessionContext::new_with_state(state);
-        let mut statement = format!(
-            "CREATE EXTERNAL TABLE taxi STORED AS ICEBERG \
-             LOCATION '{FIXTURE_METADATA_URI}'"
-        );
-        if !table_options.is_empty() {
-            let options = table_options
-                .into_iter()
-                .map(|(key, value)| {
-                    format!(
-                        "'{}' '{}'",
-                        key.replace('\'', "''"),
-                        value.replace('\'', "''")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            statement.push_str(&format!(" OPTIONS ({options})"));
-        }
-        ctx.sql(&statement).await?.collect().await?;
-        Ok(Self { ctx })
-    }
-
     pub async fn query(&self, sql: &str) -> Result<(String, String)> {
         let dataframe: DataFrame = self.ctx.sql(sql).await?;
         let plan = dataframe.create_physical_plan().await?;
@@ -148,7 +113,36 @@ impl IcebergTestHarnessBuilder {
             files: self.files,
             ..FixtureStorageFactory::default()
         };
-        IcebergTestHarness::create(storage_factory, self.table_options).await
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(SessionConfig::new().with_target_partitions(4))
+            .with_iceberg_integration(IcebergIntegrationOptions {
+                storage_factory: Arc::new(storage_factory),
+                iceberg_runtime: iceberg::Runtime::current(),
+            })
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        let mut statement = format!(
+            "CREATE EXTERNAL TABLE taxi STORED AS ICEBERG \
+             LOCATION '{FIXTURE_METADATA_URI}'"
+        );
+        if !self.table_options.is_empty() {
+            let options = self
+                .table_options
+                .into_iter()
+                .map(|(key, value)| {
+                    format!(
+                        "'{}' '{}'",
+                        key.replace('\'', "''"),
+                        value.replace('\'', "''")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            statement.push_str(&format!(" OPTIONS ({options})"));
+        }
+        ctx.sql(&statement).await?.collect().await?;
+        Ok(IcebergTestHarness { ctx })
     }
 }
 
