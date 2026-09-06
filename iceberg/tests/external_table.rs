@@ -1,9 +1,14 @@
+mod common;
+
 #[cfg(test)]
 mod tests {
     use datafusion::error::Result;
+    use datafusion::scalar::ScalarValue;
     use datafusion_distributed_iceberg::test_utils::{
         FIXTURE_URI, IcebergTestHarness, taxi_metadata_builder,
     };
+
+    use crate::common::assert_scalar_result;
 
     #[tokio::test]
     async fn registers_the_fixture_with_the_iceberg_schema() -> Result<()> {
@@ -46,15 +51,11 @@ mod tests {
             )
             .build()
             .await?;
-        let (_, batches) = harness.query("SELECT COUNT(*) AS trips FROM taxi").await?;
+        let (_, batches) = harness
+            .query_raw("SELECT COUNT(*) AS trips FROM taxi")
+            .await?;
 
-        insta::assert_snapshot!(batches, @"
-        +-------+
-        | trips |
-        +-------+
-        | 0     |
-        +-------+
-        ");
+        assert_scalar_result(&batches, "trips", ScalarValue::Int64(Some(0)))?;
         Ok(())
     }
 
@@ -82,15 +83,11 @@ mod tests {
             .with_table_option("iceberg.snapshot_id", "3167948105555765929")
             .build()
             .await?;
-        let (_, batches) = harness.query("SELECT COUNT(*) AS trips FROM taxi").await?;
+        let (_, batches) = harness
+            .query_raw("SELECT COUNT(*) AS trips FROM taxi")
+            .await?;
 
-        insta::assert_snapshot!(batches, @r"
-    +--------+
-    | trips  |
-    +--------+
-    | 175000 |
-    +--------+
-    ");
+        assert_scalar_result(&batches, "trips", ScalarValue::Int64(Some(175_000)))?;
 
         Ok(())
     }

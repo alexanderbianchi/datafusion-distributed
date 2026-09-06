@@ -1,3 +1,5 @@
+mod common;
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -18,6 +20,8 @@ mod tests {
         ManifestWriterBuilder, Operation, Snapshot, Struct, Summary, TableMetadata,
     };
     use test_case::test_case;
+
+    use crate::common::assert_scalar_result;
 
     // Values from the checked-in taxi snapshot summary.
     const TAXI_ROWS: usize = 175_000;
@@ -131,21 +135,17 @@ mod tests {
     async fn exact_row_count_lets_count_star_skip_the_scan(enabled: bool) -> Result<()> {
         let mut harness = IcebergTestHarness::new().await?;
         harness.ctx.set_iceberg_column_stats_enabled(enabled);
-        let (plan, batches) = harness.query("SELECT count(*) FROM taxi").await?;
+        let (plan, batches) = harness.query_raw("SELECT count(*) FROM taxi").await?;
 
-        insta::allow_duplicates! {
-            insta::assert_snapshot!(plan, @"
-            ProjectionExec: expr=[175000 as count(*)]
-              PlaceholderRowExec
-            ");
-            insta::assert_snapshot!(batches, @"
-            +----------+
-            | count(*) |
-            +----------+
-            | 175000   |
-            +----------+
-            ");
-        }
+        assert_eq!(plan.name(), "ProjectionExec");
+        let children = plan.children();
+        assert_eq!(children.len(), 1, "count projection must have one child");
+        assert_eq!(children[0].name(), "PlaceholderRowExec");
+        assert_scalar_result(
+            &batches,
+            "count(*)",
+            ScalarValue::Int64(Some(TAXI_ROWS as i64)),
+        )?;
         Ok(())
     }
 
